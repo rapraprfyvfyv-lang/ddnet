@@ -529,6 +529,7 @@ int CGameClient::OnSnapInput(int *pData, bool Dummy, bool Force)
 {
 	if(!Dummy)
 	{
+		// TAS playback: подаём записанный инпут вместо живого
 		if(m_Tas.IsPlayback())
 		{
 			CNetObj_PlayerInput TasInput;
@@ -538,6 +539,15 @@ int CGameClient::OnSnapInput(int *pData, bool Dummy, bool Force)
 				mem_copy(pData, &TasInput, sizeof(TasInput));
 				return sizeof(TasInput) / sizeof(int);
 			}
+		}
+		// TAS recording: замораживаем основного персонажа
+		if(m_Tas.IsRecording())
+		{
+			CNetObj_PlayerInput FrozenInput;
+			mem_zero(&FrozenInput, sizeof(FrozenInput));
+			FrozenInput.m_PlayerFlags = PLAYERFLAG_PLAYING;
+			mem_copy(pData, &FrozenInput, sizeof(FrozenInput));
+			return sizeof(FrozenInput) / sizeof(int);
 		}
 		return m_Controls.SnapInput(pData);
 	}
