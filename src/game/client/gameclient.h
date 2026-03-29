@@ -59,6 +59,7 @@
 #include "components/particles.h"
 #include "components/players.h"
 #include "components/race_demo.h"
+#include "components/tas.h"
 #include "components/scoreboard.h"
 #include "components/skins.h"
 #include "components/skins7.h"
@@ -161,6 +162,7 @@ public:
 	CImportantAlert m_ImportantAlert;
 	CDebugHud m_DebugHud;
 	CControls m_Controls;
+	CTas m_Tas;
 	CEffects m_Effects;
 	CScoreboard m_Scoreboard;
 	CStatboard m_Statboard;
