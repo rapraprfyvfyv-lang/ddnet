@@ -124,7 +124,8 @@ void CGameClient::OnConsoleInit()
 					      &m_Binds,
 					      &m_Binds.m_SpecialBinds,
 					      &m_Controls,
-					      &m_Camera,
+						  &m_Tas,
+						  &m_Camera,
 					      &m_Sounds,
 					      &m_Voting,
 					      &m_Particles, // doesn't render anything, just updates all the particles
@@ -174,6 +175,7 @@ void CGameClient::OnConsoleInit()
 						  &m_Emoticon,
 						  &m_ImportantAlert,
 						  &m_Menus,
+						  &m_Tas,
 						  &m_Controls,
 						  &m_TouchControls,
 						  &m_Binds});
@@ -527,6 +529,16 @@ int CGameClient::OnSnapInput(int *pData, bool Dummy, bool Force)
 {
 	if(!Dummy)
 	{
+		if(m_Tas.IsPlayback())
+		{
+			CNetObj_PlayerInput TasInput;
+			mem_zero(&TasInput, sizeof(TasInput));
+			if(m_Tas.GetPlaybackInput(reinterpret_cast<int*>(&TasInput)))
+			{
+				mem_copy(pData, &TasInput, sizeof(TasInput));
+				return sizeof(TasInput) / sizeof(int);
+			}
+		}
 		return m_Controls.SnapInput(pData);
 	}
 	if(m_aLocalIds[!g_Config.m_ClDummy] < 0)
