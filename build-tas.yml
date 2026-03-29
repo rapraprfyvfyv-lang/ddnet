@@ -1,0 +1,133 @@
+# DDNet TAS — GitHub Actions Build Workflow
+#
+# КАК ИСПОЛЬЗОВАТЬ:
+#   1. Форкни https://github.com/ddnet/ddnet на свой GitHub аккаунт
+#   2. Загрузи файлы патча:
+#        - скопируй tas.h и tas.cpp в папку src/game/client/components/
+#        - примени ddnet_tas.patch  (или внеси изменения вручную по INSTALL.md)
+#   3. Создай папку .github/workflows/ в репо (если её нет)
+#   4. Положи этот файл туда как build-tas.yml
+#   5. Перейди на GitHub → Actions → "Build DDNet TAS" → Run workflow
+#   6. Скачай DDNet-TAS-windows.zip из артефактов — внутри готовый .exe
+
+name: Build DDNet TAS
+
+on:
+  # Запуск вручную из вкладки Actions
+  workflow_dispatch:
+  # Автозапуск при push в main/master
+  push:
+    branches: [main, master]
+    paths:
+      - 'src/game/client/components/tas.h'
+      - 'src/game/client/components/tas.cpp'
+      - 'src/game/client/gameclient.h'
+      - 'src/game/client/gameclient.cpp'
+
+jobs:
+  # ══════════════════════════════════════════════════════════
+  # Windows x64 — главный артефакт (.exe)
+  # ══════════════════════════════════════════════════════════
+  build-windows:
+    name: Windows x64
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Configure CMake
+        run: |
+          cmake -B release -A x64 `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DEXCEPTION_HANDLING=ON `
+            -DVULKAN=OFF
+
+      - name: Build
+        run: cmake --build release --config Release --target DDNet
+
+      - name: Collect artifacts
+        shell: bash
+        run: |
+          mkdir -p artifacts
+          cp release/Release/DDNet.exe artifacts/DDNet-TAS.exe
+          # Копируем нужные DLL из staging папки если есть
+          find release -name "*.dll" -not -path "*/CMakeFiles/*" \
+            -exec cp {} artifacts/ \; 2>/dev/null || true
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DDNet-TAS-windows
+          path: artifacts/
+          retention-days: 30
+
+  # ══════════════════════════════════════════════════════════
+  # Linux x64 (бонус — если нужен)
+  # ══════════════════════════════════════════════════════════
+  build-linux:
+    name: Linux x64
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y \
+            cmake ninja-build \
+            libfreetype6-dev \
+            libsdl2-dev \
+            libsqlite3-dev \
+            libcurl4-openssl-dev \
+            libpng-dev \
+            libglew-dev \
+            libnotify-dev
+
+      - name: Configure CMake
+        run: |
+          cmake -B release -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DVULKAN=OFF
+
+      - name: Build
+        run: cmake --build release --target DDNet
+
+      - name: Collect artifacts
+        run: |
+          mkdir -p artifacts
+          cp release/DDNet artifacts/DDNet-TAS
+
+      - name: Upload Linux artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DDNet-TAS-linux
+          path: artifacts/
+          retention-days: 30
+
+  # ══════════════════════════════════════════════════════════
+  # Итоговое сообщение
+  # ══════════════════════════════════════════════════════════
+  summary:
+    name: Build Summary
+    runs-on: ubuntu-latest
+    needs: [build-windows, build-linux]
+    if: always()
+
+    steps:
+      - name: Print summary
+        run: |
+          echo "## DDNet TAS Build Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Platform | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| Windows x64 | ${{ needs.build-windows.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Linux x64   | ${{ needs.build-linux.result }}   |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Скачай артефакты на вкладке **Actions → эта сборка → Artifacts**" >> $GITHUB_STEP_SUMMARY
