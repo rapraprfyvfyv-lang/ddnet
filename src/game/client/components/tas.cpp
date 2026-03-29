@@ -1,5 +1,10 @@
-/* DDNet TAS Patch — tas.cpp
- * Ghost-World реализация
+/* DDNet TAS — Ghost World реализация (исправленная)
+ *
+ * Исправления:
+ *   1. Ghost рендерится через RenderPlayer/RenderHook (как настоящий тee)
+ *   2. Jump/Fire — правильные счётчики (не просто 0/1)
+ *   3. Основной персонаж заморожен во время записи
+ *   4. Ghost-мир строится из CNetObj_Character снапа (без телепортации)
  */
 
 #include "tas.h"
@@ -11,8 +16,10 @@
 #include <engine/shared/config.h>
 #include <engine/textrender.h>
 #include <game/client/components/controls.h>
+#include <game/client/components/players.h>
 #include <game/client/gameclient.h>
 #include <game/client/prediction/entities/character.h>
+#include <game/client/render.h>
 
 #include <generated/protocol.h>
 
@@ -33,6 +40,8 @@ void CTas::OnReset()
 	m_GhostWorldReady = false;
 	m_SlowmoAccum     = 0.0f;
 	mem_zero(&m_PrevGhostInput, sizeof(m_PrevGhostInput));
+	mem_zero(&m_GhostCharCur, sizeof(m_GhostCharCur));
+	mem_zero(&m_GhostCharPrev, sizeof(m_GhostCharPrev));
 }
 
 // ════════════════════════════════════════════════════════════
@@ -43,28 +52,61 @@ void CTas::OnConsoleInit()
 	Console()->Register("tas_play",          "",   CFGFLAG_CLIENT, ConTasPlay,         this, "Play back TAS");
 	Console()->Register("tas_stop",          "",   CFGFLAG_CLIENT, ConTasStop,         this, "Stop TAS");
 	Console()->Register("tas_rewind",        "?i", CFGFLAG_CLIENT, ConTasRewind,       this, "Rewind N ticks (default 50)");
-	Console()->Register("tas_slowmo",        "f",  CFGFLAG_CLIENT, ConTasSlowmo,       this, "Ghost world speed 0.05-1.0");
+	Console()->Register("tas_slowmo",        "f",  CFGFLAG_CLIENT, ConTasSlowmo,       this, "Ghost world speed 0.05-1.0 (default 0.25)");
 	Console()->Register("tas_pause",         "",   CFGFLAG_CLIENT, ConTasPause,        this, "Toggle ghost world pause");
 	Console()->Register("tas_frame_advance", "",   CFGFLAG_CLIENT, ConTasFrameAdvance, this, "Advance ghost 1 tick");
 	Console()->Register("tas_clear",         "",   CFGFLAG_CLIENT, ConTasClear,        this, "Clear recording");
 }
 
 // ════════════════════════════════════════════════════════════
-// InitGhostWorld — копируем текущий PredictedWorld в наш ghost-мир
+// Конвертируем состояние CCharacter из ghost-мира в CNetObj_Character
+// для рендера через стандартный RenderPlayer
+// ════════════════════════════════════════════════════════════
+static void CharToNetObj(const CCharacter *pChar, CNetObj_Character *pOut)
+{
+	const CCharacterCore *pCore = pChar->Core();
+	mem_zero(pOut, sizeof(*pOut));
+	pOut->m_X          = (int)pCore->m_Pos.x;
+	pOut->m_Y          = (int)pCore->m_Pos.y;
+	pOut->m_VelX       = (int)(pCore->m_Vel.x * 256.0f);
+	pOut->m_VelY       = (int)(pCore->m_Vel.y * 256.0f);
+	pOut->m_Angle      = (int)(pCore->m_Angle * 256.0f);
+	pOut->m_Direction  = pCore->m_Direction;
+	pOut->m_Jumped     = pCore->m_Jumped;
+	pOut->m_HookedPlayer = pCore->HookedPlayer();
+	pOut->m_HookState  = pCore->m_HookState;
+	pOut->m_HookX      = (int)pCore->m_HookPos.x;
+	pOut->m_HookY      = (int)pCore->m_HookPos.y;
+	pOut->m_HookDx     = (int)(pCore->m_HookDir.x * 256.0f);
+	pOut->m_HookDy     = (int)(pCore->m_HookDir.y * 256.0f);
+	pOut->m_Weapon     = pChar->GetActiveWeapon();
+	pOut->m_PlayerFlags= PLAYERFLAG_PLAYING;
+}
+
+// ════════════════════════════════════════════════════════════
+// InitGhostWorld — копируем snapshot в ghost-мир
 // ════════════════════════════════════════════════════════════
 void CTas::InitGhostWorld()
 {
+	// Копируем предсказательный мир
 	m_GhostWorld.CopyWorld(&GameClient()->m_PredictedWorld);
 	m_GhostTick       = Client()->GameTick(g_Config.m_ClDummy);
 	m_GhostWorldReady = true;
 	m_SlowmoAccum     = 0.0f;
 	mem_zero(&m_PrevGhostInput, sizeof(m_PrevGhostInput));
-	// Начальные флаги
 	m_PrevGhostInput.m_PlayerFlags = PLAYERFLAG_PLAYING;
+
+	// Инициализируем отображаемые данные ghost
+	const int LocalId = GameClient()->m_Snap.m_LocalClientId;
+	if(const CCharacter *pChar = m_GhostWorld.GetCharacterById(LocalId))
+	{
+		CharToNetObj(pChar, &m_GhostCharCur);
+		m_GhostCharPrev = m_GhostCharCur;
+	}
 }
 
 // ════════════════════════════════════════════════════════════
-// StepGhostWorld — один тик ghost-мира с текущим инпутом игрока
+// StepGhostWorld — один тик ghost-мира
 // ════════════════════════════════════════════════════════════
 void CTas::StepGhostWorld()
 {
@@ -76,48 +118,55 @@ void CTas::StepGhostWorld()
 	if(!pChar)
 		return;
 
-	// Читаем живой инпут от Controls
+	// Читаем живой инпут
 	const CNetObj_PlayerInput &LiveInp =
 		GameClient()->m_Controls.m_aInputData[g_Config.m_ClDummy];
 
-	// Строим корректный CNetObj_PlayerInput для ghost-мира:
-	// Jump и Fire — счётчики, не просто 0/1
+	// Собираем инпут с правильными счётчиками
 	CNetObj_PlayerInput GhostInp;
-	GhostInp.m_Direction   = LiveInp.m_Direction;
-	GhostInp.m_TargetX     = LiveInp.m_TargetX;
-	GhostInp.m_TargetY     = LiveInp.m_TargetY;
-	GhostInp.m_Hook        = LiveInp.m_Hook;
-	GhostInp.m_PlayerFlags = PLAYERFLAG_PLAYING;
-	GhostInp.m_WantedWeapon= LiveInp.m_WantedWeapon;
-	GhostInp.m_NextWeapon  = LiveInp.m_NextWeapon;
-	GhostInp.m_PrevWeapon  = LiveInp.m_PrevWeapon;
+	mem_zero(&GhostInp, sizeof(GhostInp));
+	GhostInp.m_Direction    = LiveInp.m_Direction;
+	GhostInp.m_TargetX      = LiveInp.m_TargetX;
+	GhostInp.m_TargetY      = LiveInp.m_TargetY;
+	GhostInp.m_Hook         = LiveInp.m_Hook;
+	GhostInp.m_PlayerFlags  = PLAYERFLAG_PLAYING;
+	GhostInp.m_WantedWeapon = LiveInp.m_WantedWeapon;
+	GhostInp.m_NextWeapon   = LiveInp.m_NextWeapon;
+	GhostInp.m_PrevWeapon   = LiveInp.m_PrevWeapon;
 
-	// Jump: инкрементируем счётчик при нажатии, иначе 0
-	if(LiveInp.m_Jump && !m_PrevGhostInput.m_Jump)
+	// Jump — инкрементируем счётчик при каждом новом нажатии
+	bool JumpPressed  = LiveInp.m_Jump != 0;
+	bool WasJumping   = m_PrevGhostInput.m_Jump != 0;
+	if(JumpPressed && !WasJumping)
 		GhostInp.m_Jump = m_PrevGhostInput.m_Jump + 1;
-	else if(!LiveInp.m_Jump)
+	else if(!JumpPressed)
 		GhostInp.m_Jump = 0;
 	else
 		GhostInp.m_Jump = m_PrevGhostInput.m_Jump;
 
-	// Fire: инкрементируем при нажатии
-	if(LiveInp.m_Fire && !(m_PrevGhostInput.m_Fire & 1))
-		GhostInp.m_Fire = (m_PrevGhostInput.m_Fire + 1) & INPUT_STATE_MASK;
-	else if(!LiveInp.m_Fire && (m_PrevGhostInput.m_Fire & 1))
+	// Fire — инкрементируем при смене состояния (0→1 и 1→0)
+	bool FirePressed  = (LiveInp.m_Fire & 1) != 0;
+	bool WasFiring    = (m_PrevGhostInput.m_Fire & 1) != 0;
+	if(FirePressed != WasFiring)
 		GhostInp.m_Fire = (m_PrevGhostInput.m_Fire + 1) & INPUT_STATE_MASK;
 	else
 		GhostInp.m_Fire = m_PrevGhostInput.m_Fire & INPUT_STATE_MASK;
 
-	// Применяем инпут к ghost-персонажу
-	pChar->OnPredictedInput(&GhostInp);
+	// Сохраняем предыдущий кадр для рендера (интерполяция)
+	m_GhostCharPrev = m_GhostCharCur;
 
-	// Шагаем ghost-мир
+	// Применяем инпут и шагаем мир
+	pChar->OnPredictedInput(&GhostInp);
 	m_GhostWorld.Tick();
 	m_GhostTick++;
 
-	// Сохраняем инпут в запись
+	// Обновляем текущее состояние ghost для рендера
+	if(const CCharacter *pCharNew = m_GhostWorld.GetCharacterById(LocalId))
+		CharToNetObj(pCharNew, &m_GhostCharCur);
+
+	// Записываем тик
 	STasFrame Frame;
-	Frame.m_Tick              = m_GhostTick;
+	Frame.m_Tick                = m_GhostTick;
 	Frame.m_Input.m_Direction   = GhostInp.m_Direction;
 	Frame.m_Input.m_TargetX     = GhostInp.m_TargetX;
 	Frame.m_Input.m_TargetY     = GhostInp.m_TargetY;
@@ -130,7 +179,9 @@ void CTas::StepGhostWorld()
 	Frame.m_Input.m_PrevWeapon  = GhostInp.m_PrevWeapon;
 	m_vFrames.push_back(Frame);
 
-	// Запоминаем предыдущий инпут
+	// Запоминаем инпут для следующего тика
+	Frame.m_Input.m_Jump = GhostInp.m_Jump;
+	Frame.m_Input.m_Fire = GhostInp.m_Fire;
 	mem_copy(&m_PrevGhostInput, &Frame.m_Input, sizeof(STasInput));
 }
 
@@ -148,15 +199,12 @@ void CTas::OnRender()
 
 	if(m_Mode == ETasMode::RECORDING && NewTick)
 	{
-		// Инициализируем ghost-мир при первом тике записи
 		if(!m_GhostWorldReady)
 			InitGhostWorld();
 
 		if(!m_Paused || m_FrameAdvance)
 		{
-			// Накапливаем время slowmo
 			m_SlowmoAccum += m_Slowmo;
-			// Шагаем ghost столько раз, сколько накопилось целых тиков
 			while(m_SlowmoAccum >= 1.0f)
 			{
 				StepGhostWorld();
@@ -164,6 +212,9 @@ void CTas::OnRender()
 			}
 		}
 		m_FrameAdvance = false;
+
+		// Рендерим ghost поверх игры
+		RenderGhost();
 	}
 	else if(m_Mode == ETasMode::PLAYBACK && NewTick)
 	{
@@ -173,7 +224,8 @@ void CTas::OnRender()
 		{
 			m_Mode          = ETasMode::IDLE;
 			m_PlaybackIndex = 0;
-			Console()->Print(IConsole::OUTPUT_LEVEL_STANDARD, "TAS", "Playback finished.");
+			Console()->Print(IConsole::OUTPUT_LEVEL_STANDARD, "TAS",
+				"Playback finished.");
 		}
 	}
 
@@ -181,38 +233,34 @@ void CTas::OnRender()
 }
 
 // ════════════════════════════════════════════════════════════
-// RenderGhost — рисуем ghost-персонажа поверх обычного рендера
+// RenderGhost — рисуем ghost-tee через стандартный RenderPlayer
 // ════════════════════════════════════════════════════════════
 void CTas::RenderGhost()
 {
-	if(m_Mode != ETasMode::RECORDING || !m_GhostWorldReady)
+	if(!m_GhostWorldReady)
 		return;
 
+	// Берём RenderInfo локального игрока и делаем его полупрозрачным
 	const int LocalId = GameClient()->m_Snap.m_LocalClientId;
-	const CCharacter *pChar = m_GhostWorld.GetCharacterById(LocalId);
-	if(!pChar)
+	if(LocalId < 0)
 		return;
 
-	// Получаем позицию ghost-персонажа
-	const vec2 GhostPos = pChar->Core()->m_Pos;
+	CTeeRenderInfo GhostRenderInfo = GameClient()->m_aClients[LocalId].m_RenderInfo;
+	// Синеватый оттенок + полупрозрачность для ghost
+	GhostRenderInfo.m_ColorBody  = ColorRGBA(0.4f, 0.6f, 1.0f, 0.7f);
+	GhostRenderInfo.m_ColorFeet  = ColorRGBA(0.3f, 0.5f, 0.9f, 0.7f);
+	GhostRenderInfo.m_CustomColoredSkin = true;
 
-	// Рисуем простой кружок-маркер на позиции ghost
-	// (полноценный скин рисовать сложнее — оставим маркер)
-	const float ScreenW = 300.0f * Graphics()->ScreenAspect();
-	Graphics()->MapScreen(0.0f, 0.0f, ScreenW, 300.0f);
+	// ClientId = -2 означает ghost (как в системе race ghost)
+	GameClient()->m_Players.RenderHook(
+		&m_GhostCharPrev, &m_GhostCharCur,
+		&GhostRenderInfo, -2,
+		Client()->IntraGameTick(g_Config.m_ClDummy));
 
-	// Конвертируем world-координаты в screen-координаты
-	// через камеру
-	const vec2 Center = GameClient()->m_Camera.m_Center;
-	const float Zoom  = GameClient()->m_Camera.m_Zoom;
-	const float ScrX  = ScreenW * 0.5f + (GhostPos.x - Center.x) / (32.0f * Zoom);
-	const float ScrY  = 300.0f  * 0.5f + (GhostPos.y - Center.y) / (32.0f * Zoom);
-	const float R     = 8.0f / Zoom;
-
-	// Полупрозрачный синий круг
-	Graphics()->SetColor(0.3f, 0.6f, 1.0f, 0.6f);
-	Graphics()->DrawCircle(ScrX, ScrY, R, 24);
-	Graphics()->SetColor(1.0f, 1.0f, 1.0f, 1.0f);
+	GameClient()->m_Players.RenderPlayer(
+		&m_GhostCharPrev, &m_GhostCharCur,
+		&GhostRenderInfo, -2,
+		Client()->IntraGameTick(g_Config.m_ClDummy));
 }
 
 // ════════════════════════════════════════════════════════════
@@ -253,8 +301,8 @@ void CTas::RenderHud()
 	char aBuf[256];
 	if(m_Mode == ETasMode::RECORDING)
 		str_format(aBuf, sizeof(aBuf),
-			"[TAS] REC  frames:%d  ghost_tick:%d  slowmo:%.2fx%s",
-			(int)m_vFrames.size(), m_GhostTick, m_Slowmo,
+			"[TAS] REC  frames:%d  slowmo:%.2fx%s",
+			(int)m_vFrames.size(), m_Slowmo,
 			m_Paused ? "  PAUSED" : "");
 	else if(m_Mode == ETasMode::PLAYBACK)
 		str_format(aBuf, sizeof(aBuf),
@@ -275,16 +323,15 @@ void CTas::RenderHud()
 		ColorRGBA(0.0f, 0.0f, 0.0f, 0.55f), IGraphics::CORNER_ALL, 2.0f);
 
 	if(m_Mode == ETasMode::RECORDING)
-		TextRender()->TextColor(1.0f, 0.25f, 0.25f, 1.0f);
+		TextRender()->TextColor(1.0f, 0.3f, 0.3f, 1.0f);
 	else if(m_Mode == ETasMode::PLAYBACK)
-		TextRender()->TextColor(0.25f, 1.0f, 0.25f, 1.0f);
+		TextRender()->TextColor(0.3f, 1.0f, 0.3f, 1.0f);
 	else
-		TextRender()->TextColor(1.0f, 1.0f, 0.3f, 0.85f);
+		TextRender()->TextColor(1.0f, 1.0f, 0.3f, 0.9f);
 
 	TextRender()->Text(X, Y, FontSize, aBuf, -1.0f);
 	TextRender()->TextColor(1.0f, 1.0f, 1.0f, 1.0f);
 
-	// Прогресс-бар playback
 	if(m_Mode == ETasMode::PLAYBACK && !m_vFrames.empty())
 	{
 		const float BarW = 200.0f;
@@ -292,7 +339,6 @@ void CTas::RenderHud()
 		const float BarX = (ScreenW - BarW) * 0.5f;
 		const float BarY = 291.0f;
 		const float P    = (float)m_PlaybackIndex / (float)m_vFrames.size();
-
 		Graphics()->DrawRect(BarX, BarY, BarW, BarH,
 			ColorRGBA(0.0f, 0.0f, 0.0f, 0.5f), IGraphics::CORNER_ALL, 2.0f);
 		Graphics()->DrawRect(BarX, BarY, BarW * P, BarH,
@@ -313,11 +359,11 @@ void CTas::StartRecord()
 		return;
 	}
 	m_Mode            = ETasMode::RECORDING;
-	m_GhostWorldReady = false; // будет инициализирован при первом тике
+	m_GhostWorldReady = false;
 	char aBuf[128];
 	str_format(aBuf, sizeof(aBuf),
 		"Ghost recording started. Slowmo: %.2fx. "
-		"Your character is frozen. Control the ghost!",
+		"Your char is frozen — move the blue ghost!",
 		m_Slowmo);
 	Console()->Print(IConsole::OUTPUT_LEVEL_STANDARD, "TAS", aBuf);
 }
@@ -326,14 +372,15 @@ void CTas::StopRecord()
 {
 	if(m_Mode != ETasMode::RECORDING)
 	{
-		Console()->Print(IConsole::OUTPUT_LEVEL_STANDARD, "TAS", "Not recording.");
+		Console()->Print(IConsole::OUTPUT_LEVEL_STANDARD, "TAS",
+			"Not recording.");
 		return;
 	}
 	m_Mode            = ETasMode::IDLE;
 	m_GhostWorldReady = false;
 	char aBuf[64];
 	str_format(aBuf, sizeof(aBuf),
-		"Recording stopped. %d frames saved. Use tas_play to replay.",
+		"Recording stopped. %d frames. Use tas_play.",
 		(int)m_vFrames.size());
 	Console()->Print(IConsole::OUTPUT_LEVEL_STANDARD, "TAS", aBuf);
 }
@@ -343,12 +390,13 @@ void CTas::StartPlayback()
 	if(m_vFrames.empty())
 	{
 		Console()->Print(IConsole::OUTPUT_LEVEL_STANDARD, "TAS",
-			"Nothing to play. Record first with tas_record.");
+			"Nothing to play. Use tas_record first.");
 		return;
 	}
 	m_Mode          = ETasMode::PLAYBACK;
 	m_PlaybackIndex = 0;
-	Console()->Print(IConsole::OUTPUT_LEVEL_STANDARD, "TAS", "Playback started.");
+	Console()->Print(IConsole::OUTPUT_LEVEL_STANDARD, "TAS",
+		"Playback started.");
 }
 
 void CTas::Stop()
@@ -363,19 +411,15 @@ void CTas::DoRewind(int Ticks)
 {
 	if(m_vFrames.empty())
 	{
-		Console()->Print(IConsole::OUTPUT_LEVEL_STANDARD, "TAS", "Nothing to rewind.");
+		Console()->Print(IConsole::OUTPUT_LEVEL_STANDARD, "TAS",
+			"Nothing to rewind.");
 		return;
 	}
 	const int Remove = minimum(Ticks, (int)m_vFrames.size());
 	m_vFrames.resize(m_vFrames.size() - Remove);
 
-	// Восстанавливаем ghost-мир на позицию N тиков назад
 	if(m_Mode == ETasMode::RECORDING)
-	{
-		// Переинициализируем ghost с текущего server-снапа
-		// и переигрываем оставшиеся фреймы
-		m_GhostWorldReady = false; // инициализируется при следующем тике
-	}
+		m_GhostWorldReady = false; // переинициализируется при следующем тике
 	else if(m_Mode == ETasMode::PLAYBACK)
 	{
 		m_Mode          = ETasMode::IDLE;
@@ -384,7 +428,8 @@ void CTas::DoRewind(int Ticks)
 
 	char aBuf[128];
 	str_format(aBuf, sizeof(aBuf),
-		"Rewound %d frames. Frames left: %d.", Remove, (int)m_vFrames.size());
+		"Rewound %d frames. Left: %d.",
+		Remove, (int)m_vFrames.size());
 	Console()->Print(IConsole::OUTPUT_LEVEL_STANDARD, "TAS", aBuf);
 }
 
@@ -416,7 +461,8 @@ void CTas::ConTasStop(IConsole::IResult *, void *pUser)
 
 void CTas::ConTasRewind(IConsole::IResult *pResult, void *pUser)
 {
-	const int Ticks = (pResult->NumArguments() > 0) ? pResult->GetInteger(0) : 50;
+	const int Ticks = pResult->NumArguments() > 0
+		? pResult->GetInteger(0) : 50;
 	static_cast<CTas *>(pUser)->DoRewind(Ticks);
 }
 
@@ -428,7 +474,7 @@ void CTas::ConTasSlowmo(IConsole::IResult *pResult, void *pUser)
 	if(Factor > 1.0f)  Factor = 1.0f;
 	pTas->m_Slowmo = Factor;
 	char aMsg[64];
-	str_format(aMsg, sizeof(aMsg), "Ghost world slowmo: %.2fx", Factor);
+	str_format(aMsg, sizeof(aMsg), "Ghost slowmo: %.2fx", Factor);
 	pTas->Console()->Print(IConsole::OUTPUT_LEVEL_STANDARD, "TAS", aMsg);
 }
 
@@ -439,14 +485,16 @@ void CTas::ConTasClear(IConsole::IResult *, void *pUser)
 	pTas->m_Mode            = ETasMode::IDLE;
 	pTas->m_PlaybackIndex   = 0;
 	pTas->m_GhostWorldReady = false;
-	pTas->Console()->Print(IConsole::OUTPUT_LEVEL_STANDARD, "TAS", "Recording cleared.");
+	pTas->Console()->Print(IConsole::OUTPUT_LEVEL_STANDARD, "TAS",
+		"Recording cleared.");
 }
 
 void CTas::ConTasFrameAdvance(IConsole::IResult *, void *pUser)
 {
 	CTas *pTas = static_cast<CTas *>(pUser);
 	pTas->m_FrameAdvance = true;
-	pTas->Console()->Print(IConsole::OUTPUT_LEVEL_STANDARD, "TAS", "Ghost +1 tick.");
+	pTas->Console()->Print(IConsole::OUTPUT_LEVEL_STANDARD, "TAS",
+		"Ghost +1 tick.");
 }
 
 void CTas::ConTasPause(IConsole::IResult *, void *pUser)
@@ -454,5 +502,5 @@ void CTas::ConTasPause(IConsole::IResult *, void *pUser)
 	CTas *pTas = static_cast<CTas *>(pUser);
 	pTas->m_Paused = !pTas->m_Paused;
 	pTas->Console()->Print(IConsole::OUTPUT_LEVEL_STANDARD, "TAS",
-		pTas->m_Paused ? "Ghost world paused." : "Ghost world resumed.");
+		pTas->m_Paused ? "Ghost paused." : "Ghost resumed.");
 }
