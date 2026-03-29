@@ -303,7 +303,9 @@ void CTas::ConTasRewind(IConsole::IResult *pResult, void *pUser)
 void CTas::ConTasSlowmo(IConsole::IResult *pResult, void *pUser)
 {
 	CTas *pTas = static_cast<CTas *>(pUser);
-	float Factor = clamp(pResult->GetFloat(0), 0.05f, 1.0f);
+	float Factor = pResult->GetFloat(0);
+	if(Factor < 0.05f) Factor = 0.05f;
+	if(Factor > 1.0f)  Factor = 1.0f;
 	pTas->m_Slowmo = Factor;
 
 	// Замедление через встроенную переменную демо-плеера.
@@ -311,7 +313,7 @@ void CTas::ConTasSlowmo(IConsole::IResult *pResult, void *pUser)
 	// она замедляет рендер/тик-аккумулятор клиента.
 	char aBuf[64];
 	str_format(aBuf, sizeof(aBuf), "cl_demo_slowmo %.2f", Factor);
-	pTas->Console()->ExecuteLine(aBuf);
+	pTas->Console()->ExecuteLine(aBuf, -1);
 
 	char aMsg[64];
 	str_format(aMsg, sizeof(aMsg), "Slowmo: %.2fx", Factor);
@@ -338,7 +340,7 @@ void CTas::ConTasPause(IConsole::IResult *, void *pUser)
 {
 	CTas *pTas = static_cast<CTas *>(pUser);
 	pTas->m_Paused = !pTas->m_Paused;
-	pTas->Console()->ExecuteLine(pTas->m_Paused ? "cl_demo_slowmo 0.01" : "cl_demo_slowmo 1.0");
+	pTas->Console()->ExecuteLine(pTas->m_Paused ? "cl_demo_slowmo 0.01" : "cl_demo_slowmo 1.0", -1);
 	pTas->Console()->Print(IConsole::OUTPUT_LEVEL_STANDARD, "TAS",
 		pTas->m_Paused ? "Paused." : "Resumed.");
 }
