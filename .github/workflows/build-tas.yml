@@ -1,21 +1,7 @@
-# DDNet TAS — GitHub Actions Build Workflow
-#
-# КАК ИСПОЛЬЗОВАТЬ:
-#   1. Форкни https://github.com/ddnet/ddnet на свой GitHub аккаунт
-#   2. Загрузи файлы патча:
-#        - скопируй tas.h и tas.cpp в папку src/game/client/components/
-#        - примени ddnet_tas.patch  (или внеси изменения вручную по INSTALL.md)
-#   3. Создай папку .github/workflows/ в репо (если её нет)
-#   4. Положи этот файл туда как build-tas.yml
-#   5. Перейди на GitHub → Actions → "Build DDNet TAS" → Run workflow
-#   6. Скачай DDNet-TAS-windows.zip из артефактов — внутри готовый .exe
-
 name: Build DDNet TAS
 
 on:
-  # Запуск вручную из вкладки Actions
   workflow_dispatch:
-  # Автозапуск при push в main/master
   push:
     branches: [main, master]
     paths:
@@ -26,7 +12,7 @@ on:
 
 jobs:
   # ══════════════════════════════════════════════════════════
-  # Windows x64 — главный артефакт (.exe)
+  # Windows x64
   # ══════════════════════════════════════════════════════════
   build-windows:
     name: Windows x64
@@ -39,23 +25,26 @@ jobs:
           submodules: recursive
 
       - name: Configure CMake
-        run: |
-          cmake -B release -A x64 `
-            -DCMAKE_BUILD_TYPE=Release `
-            -DEXCEPTION_HANDLING=ON `
-            -DVULKAN=OFF
+        run: cmake -B release -A x64 -DEXCEPTION_HANDLING=ON -DVULKAN=OFF
 
-      - name: Build
-        run: cmake --build release --config Release --target DDNet
+      - name: Build DDNet (Release)
+        run: cmake --build release --config Release --target package_default
 
-      - name: Collect artifacts
+      - name: Find and collect artifacts
         shell: bash
         run: |
           mkdir -p artifacts
-          cp release/Release/DDNet.exe artifacts/DDNet-TAS.exe
-          # Копируем нужные DLL из staging папки если есть
-          find release -name "*.dll" -not -path "*/CMakeFiles/*" \
-            -exec cp {} artifacts/ \; 2>/dev/null || true
+          # Ищем zip с Windows билдом
+          find release -name "*-win64.zip" | while read f; do
+            cp "$f" artifacts/DDNet-TAS-windows.zip
+          done
+          # Если zip не нашёлся — ищем .exe напрямую
+          if [ ! -f artifacts/DDNet-TAS-windows.zip ]; then
+            find release -name "DDNet.exe" | head -1 | while read f; do
+              cp "$f" artifacts/DDNet-TAS.exe
+            done
+          fi
+          ls -la artifacts/
 
       - name: Upload Windows artifact
         uses: actions/upload-artifact@v4
@@ -65,7 +54,7 @@ jobs:
           retention-days: 30
 
   # ══════════════════════════════════════════════════════════
-  # Linux x64 (бонус — если нужен)
+  # Linux x64
   # ══════════════════════════════════════════════════════════
   build-linux:
     name: Linux x64
@@ -88,21 +77,27 @@ jobs:
             libcurl4-openssl-dev \
             libpng-dev \
             libglew-dev \
-            libnotify-dev
+            libnotify-dev \
+            libavcodec-dev libavformat-dev libavutil-dev \
+            libswresample-dev libswscale-dev libx264-dev
 
       - name: Configure CMake
-        run: |
-          cmake -B release -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DVULKAN=OFF
+        run: cmake -B release -G Ninja -DCMAKE_BUILD_TYPE=Release -DVULKAN=OFF
 
-      - name: Build
-        run: cmake --build release --target DDNet
+      - name: Build DDNet (Release)
+        run: cmake --build release --target package_default
 
       - name: Collect artifacts
         run: |
           mkdir -p artifacts
-          cp release/DDNet artifacts/DDNet-TAS
+          find release -name "*.tar.xz" -o -name "*.AppImage" | head -1 | while read f; do
+            cp "$f" artifacts/
+          done
+          # Fallback — просто бинарник
+          if [ -z "$(ls artifacts/)" ]; then
+            cp release/DDNet artifacts/DDNet-TAS 2>/dev/null || true
+          fi
+          ls -la artifacts/
 
       - name: Upload Linux artifact
         uses: actions/upload-artifact@v4
@@ -112,7 +107,7 @@ jobs:
           retention-days: 30
 
   # ══════════════════════════════════════════════════════════
-  # Итоговое сообщение
+  # Итог
   # ══════════════════════════════════════════════════════════
   summary:
     name: Build Summary
@@ -123,11 +118,10 @@ jobs:
     steps:
       - name: Print summary
         run: |
-          echo "## DDNet TAS Build Results" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## DDNet TAS Build" >> $GITHUB_STEP_SUMMARY
           echo "| Platform | Status |" >> $GITHUB_STEP_SUMMARY
           echo "|---|---|" >> $GITHUB_STEP_SUMMARY
           echo "| Windows x64 | ${{ needs.build-windows.result }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Linux x64   | ${{ needs.build-linux.result }}   |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "Скачай артефакты на вкладке **Actions → эта сборка → Artifacts**" >> $GITHUB_STEP_SUMMARY
+          echo "Скачай артефакты внизу страницы сборки." >> $GITHUB_STEP_SUMMARY
