@@ -2401,6 +2401,8 @@ if(CLIENT)
     components/console.h
     components/controls.cpp
     components/controls.h
+    components/tas.cpp
+    components/tas.h
     components/countryflags.cpp
     components/countryflags.h
     components/damageind.cpp
